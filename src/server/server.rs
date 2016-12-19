@@ -23,7 +23,7 @@ use mio::tcp::{TcpListener, TcpStream};
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::msgpb::{MessageType, Message};
 use super::{Msg, ConnData};
-use super::conn::Conn;
+use super::conn::{Conn, StoreConnKey};
 use super::{Result, OnResponse, Config};
 use util::worker::{Stopped, Worker};
 use util::transport::SendCh;
@@ -43,7 +43,7 @@ pub use super::client_loop::ServerChannel;
 const SERVER_TOKEN: Token = Token(1);
 const FIRST_CUSTOM_TOKEN: Token = Token(1024);
 const DEFAULT_COPROCESSOR_BATCH: usize = 50;
-const DEFAULT_CLIENT_LOOP_NUM: usize = 2;
+const DEFAULT_CLIENT_LOOP_NUM: usize = 3;
 
 pub fn create_event_loop<T, S>(config: &Config) -> Result<EventLoop<Server<T, S>>>
     where T: RaftStoreRouter,
@@ -79,7 +79,8 @@ pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver> {
 
     // store id -> Token
     // This is for communicating with other raft stores.
-    store_tokens: HashMap<u64, Token>,
+    store_tokens: HashMap<StoreConnKey, Token>,
+
     store_resolving: HashSet<u64>,
 
     ch: ServerChannel<T>,
@@ -203,11 +204,11 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
                 CONNECTION_GAUGE.dec();
                 debug!("remove connection token {:?}", token);
                 // if connected to remote store, remove this too.
-                if let Some(store_id) = conn.store_id {
+                if let Some(conn_key) = conn.conn_key {
                     warn!("remove store connection for store {} with token {:?}",
-                          store_id,
+                          conn_key.store_id,
                           token);
-                    self.store_tokens.remove(&store_id);
+                    self.store_tokens.remove(&conn_key);
                 }
 
                 if let Err(e) = event_loop.deregister(&conn.sock) {
@@ -231,7 +232,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
     fn add_new_conn(&mut self,
                     event_loop: &mut EventLoop<Self>,
                     sock: TcpStream,
-                    store_id: u64)
+                    conn_key: StoreConnKey)
                     -> Result<Token> {
         let new_token = self.gen_token();
 
@@ -247,7 +248,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
 
         let conn = Conn::new(sock,
                              new_token,
-                             Some(store_id),
+                             Some(conn_key),
                              self.snap_worker.scheduler(),
                              self.sendch.clone());
         self.conns.insert(new_token, conn);
@@ -394,26 +395,27 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
     fn try_connect(&mut self,
                    event_loop: &mut EventLoop<Self>,
                    sock_addr: SocketAddr,
-                   store_id: u64)
+                   conn_key: StoreConnKey)
                    -> Result<Token> {
         let sock = try!(TcpStream::connect(&sock_addr));
-        let token = try!(self.add_new_conn(event_loop, sock, store_id));
+        let token = try!(self.add_new_conn(event_loop, sock, conn_key));
         Ok(token)
     }
 
     fn connect_store(&mut self,
                      event_loop: &mut EventLoop<Self>,
-                     store_id: u64,
+                     conn_key: StoreConnKey,
                      sock_addr: SocketAddr)
                      -> Result<Token> {
+        let store_id = conn_key.store_id;
         // We may already create the connection before.
-        if let Some(token) = self.store_tokens.get(&store_id).cloned() {
+        if let Some(token) = self.store_tokens.get(&conn_key).cloned() {
             debug!("token already exists for store {}, reuse", store_id);
             return Ok(token);
         }
 
-        let token = try!(self.try_connect(event_loop, sock_addr, store_id));
-        self.store_tokens.insert(store_id, token);
+        let token = try!(self.try_connect(event_loop, sock_addr, conn_key));
+        self.store_tokens.insert(conn_key, token);
         Ok(token)
     }
 
@@ -456,8 +458,9 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
             return self.resolve_store(store_id, data);
         }
 
+        let conn_key = StoreConnKey::new(store_id, data.get_region_id());
         // check the corresponding token for store.
-        if let Some(token) = self.store_tokens.get(&store_id).cloned() {
+        if let Some(token) = self.store_tokens.get(&conn_key).cloned() {
             return self.write_data(event_loop, token, data);
         }
 
@@ -508,7 +511,8 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
             return self.send_snapshot_sock(sock_addr, data);
         }
 
-        let token = match self.connect_store(event_loop, store_id, sock_addr) {
+        let conn_key = StoreConnKey::new(store_id, data.get_region_id());
+        let token = match self.connect_store(event_loop, conn_key, sock_addr) {
             Ok(token) => token,
             Err(e) => {
                 self.report_unreachable(data);
