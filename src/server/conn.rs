@@ -14,21 +14,18 @@
 use std::cmp;
 use std::io::Read;
 
-use mio::{Token, EventLoop, EventSet, PollOpt};
+use mio::{Token, EventLoop, EventSet, PollOpt, Handler};
 use mio::tcp::TcpStream;
 use protobuf::Message as PbMessage;
 
 use kvproto::msgpb::Message;
 use kvproto::raft_serverpb::RaftSnapshotData;
-use super::{Result, ConnData};
-use super::server::Server;
+use super::{Result, ConnData, Msg};
 use util::codec::rpc;
-use super::transport::RaftStoreRouter;
-use super::resolve::StoreAddrResolver;
 use super::snap::Task as SnapTask;
 use util::worker::Scheduler;
 use util::buf::PipeBuffer;
-
+use util::transport::SendCh;
 
 #[derive(PartialEq)]
 enum ConnType {
@@ -64,13 +61,16 @@ pub struct Conn {
     recv_buffer: Option<PipeBuffer>,
 
     pub buffer_shrink_threshold: usize,
+
+    ch: SendCh<Msg>,
 }
 
 impl Conn {
     pub fn new(sock: TcpStream,
                token: Token,
                store_id: Option<u64>,
-               snap_scheduler: Scheduler<SnapTask>)
+               snap_scheduler: Scheduler<SnapTask>,
+               ch: SendCh<Msg>)
                -> Conn {
         Conn {
             sock: sock,
@@ -85,6 +85,7 @@ impl Conn {
             send_buffer: PipeBuffer::new(DEFAULT_SEND_BUFFER_SIZE),
             recv_buffer: Some(PipeBuffer::new(DEFAULT_RECV_BUFFER_SIZE)),
             buffer_shrink_threshold: DEFAULT_BUFFER_SHRINK_THRESHOLD,
+            ch: ch,
         }
     }
 
@@ -96,20 +97,14 @@ impl Conn {
         }
     }
 
-    pub fn reregister<T, S>(&mut self, event_loop: &mut EventLoop<Server<T, S>>) -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    pub fn reregister<T: Handler>(&mut self, event_loop: &mut EventLoop<T>) -> Result<()> {
         try!(event_loop.reregister(&self.sock, self.token, self.interest, PollOpt::edge()));
         Ok(())
     }
 
-    pub fn on_readable<T, S>(&mut self,
-                             event_loop: &mut EventLoop<Server<T, S>>)
-                             -> Result<Vec<ConnData>>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    pub fn on_readable<T: Handler>(&mut self,
+                                   event_loop: &mut EventLoop<T>)
+                                   -> Result<Vec<ConnData>> {
         let mut bufs = vec![];
         match self.conn_type {
             ConnType::Handshake => try!(self.handshake(event_loop, &mut bufs)),
@@ -119,13 +114,10 @@ impl Conn {
         Ok(bufs)
     }
 
-    fn handshake<T, S>(&mut self,
-                       event_loop: &mut EventLoop<Server<T, S>>,
-                       bufs: &mut Vec<ConnData>)
-                       -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    fn handshake<T: Handler>(&mut self,
+                             event_loop: &mut EventLoop<T>,
+                             bufs: &mut Vec<ConnData>)
+                             -> Result<()> {
         let mut data = match try!(self.read_one_message()) {
             Some(data) => data,
             None => return Ok(()),
@@ -141,7 +133,8 @@ impl Conn {
             // no need to shrink, the connection will be closed soon.
             self.recv_buffer.as_mut().unwrap().ensure(expect_cap);
 
-            let register_task = SnapTask::Register(self.token, data.msg.take_raft());
+            let register_task =
+                SnapTask::Register(self.ch.clone(), self.token, data.msg.take_raft());
             box_try!(self.snap_scheduler.schedule(register_task));
 
             return self.read_snapshot(event_loop);
@@ -151,10 +144,7 @@ impl Conn {
         self.read_rpc(event_loop, bufs)
     }
 
-    fn read_snapshot<T, S>(&mut self, _: &mut EventLoop<Server<T, S>>) -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    fn read_snapshot<T: Handler>(&mut self, _: &mut EventLoop<T>) -> Result<()> {
         // all content should be read, ignore any read operation.
         if self.recv_buffer.is_none() {
             return Ok(());
@@ -175,12 +165,13 @@ impl Conn {
             let recv_buffer = self.recv_buffer.take().unwrap();
             self.expect_size -= recv_buffer.len();
 
-            let task = SnapTask::Write(self.token, recv_buffer);
+            let task = SnapTask::Write(self.ch.clone(), self.token, recv_buffer);
             box_try!(self.snap_scheduler.schedule(task));
 
             if self.expect_size == 0 {
                 // last chunk
-                box_try!(self.snap_scheduler.schedule(SnapTask::Close(self.token)));
+                box_try!(self.snap_scheduler
+                    .schedule(SnapTask::Close(self.ch.clone(), self.token)));
                 // let snap_scheduler to close the connection.
                 break;
             } else if SNAPSHOT_PAYLOAD_BUF >= self.expect_size {
@@ -224,13 +215,10 @@ impl Conn {
         }))
     }
 
-    fn read_rpc<T, S>(&mut self,
-                      _: &mut EventLoop<Server<T, S>>,
-                      bufs: &mut Vec<ConnData>)
-                      -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    fn read_rpc<T: Handler>(&mut self,
+                            _: &mut EventLoop<T>,
+                            bufs: &mut Vec<ConnData>)
+                            -> Result<()> {
         loop {
             // Because we use the edge trigger, so here we must read whole data.
             match try!(self.read_one_message()) {
@@ -242,10 +230,7 @@ impl Conn {
         Ok(())
     }
 
-    pub fn on_writable<T, S>(&mut self, event_loop: &mut EventLoop<Server<T, S>>) -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    pub fn on_writable<T: Handler>(&mut self, event_loop: &mut EventLoop<T>) -> Result<()> {
         try!(self.send_buffer.write_to(&mut self.sock));
         if !self.send_buffer.is_empty() {
             // we don't write all data, so must try later.
@@ -264,13 +249,10 @@ impl Conn {
     }
 
 
-    pub fn append_write_buf<T, S>(&mut self,
-                                  event_loop: &mut EventLoop<Server<T, S>>,
-                                  msg: ConnData)
-                                  -> Result<()>
-        where T: RaftStoreRouter,
-              S: StoreAddrResolver
-    {
+    pub fn append_write_buf<T: Handler>(&mut self,
+                                        event_loop: &mut EventLoop<T>,
+                                        msg: ConnData)
+                                        -> Result<()> {
         msg.encode_to(&mut self.send_buffer).unwrap();
 
         if !self.interest.is_writable() {

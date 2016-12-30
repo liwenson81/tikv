@@ -17,6 +17,7 @@ use std::boxed::{Box, FnBox};
 use std::io::Write;
 
 use mio::Token;
+use mio::tcp::TcpStream;
 
 use kvproto::msgpb::{self, MessageType};
 use util::codec::rpc;
@@ -24,6 +25,7 @@ use kvproto::eraftpb::MessageType as RaftMessageType;
 mod conn;
 mod kv;
 mod metrics;
+mod client_loop;
 
 pub mod config;
 pub mod errors;
@@ -128,4 +130,5 @@ pub enum Msg {
         data: ConnData,
     },
     CloseConn { token: Token },
+    Connect { token: Token, sock: TcpStream },
 }
